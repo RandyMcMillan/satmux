@@ -1,15 +1,10 @@
-# satmux ✈️🛰️
+# satmux
 
-Turn broken, high-latency geostationary (GEO) inflight Wi-Fi (Inmarsat GX / Viasat / Panasonic / SITA) into a fast, drop-free connection using a `$0.03/h` disposable cloud VM and **zero third-party dependencies** (pure Python 3 stdlib).
+TCP multiplexer and `1-RTT` HTTP/TLS relay for geostationary (GEO) inflight Wi-Fi (Inmarsat GX, Viasat, Panasonic, SITA). Pure Python 3 stdlib, zero external dependencies.
 
-Built & benchmarked live at 38,000 ft over an Inmarsat GX Ka-band satellite link (`~620 ms` RTT).
+Measured inflight over Inmarsat GX Ka-band (`~620 ms` RTT, SITA `AS206433` Amsterdam ground station):
 
 ```text
-  ╭──────────────────────────────────────────────────────────────────────────────────╮
-  │  ✈️  INFLIGHT GEO SATELLITE BENCHMARK   ·  Inmarsat GX Ka-band (~620 ms RTT)     │
-  │  Direct Cabin Wi-Fi (:443 PEP)  vs  12× Warm BBR + 1-RTT Ground-TLS + zlib       │
-  ╰──────────────────────────────────────────────────────────────────────────────────╯
-
   ORIGIN (6× PARALLEL)  RAW CABIN WI-FI (:443)    1-RTT BBR + ZLIB MUX    SPEEDUP
   ────────────────────  ────────────────────────  ──────────────────────  ─────────
   GitHub Repo           ████████████    TIMEOUT  ███░░░░░░░░░    4.66s  FIXED ✓
@@ -20,102 +15,86 @@ Built & benchmarked live at 38,000 ft over an Inmarsat GX Ka-band satellite link
   PyPI JSON API         █████░░░░░░░      7.09s  ██░░░░░░░░░░    2.64s     2.7×
   ──────────────────────────────────────────────────────────────────────────────────
   6-Origin Burst:    19.13s (3/6 failed)  →  5.35s (0/6 failed)   [3.6× faster · -76% TTFB]
-  Tunnel Stack:      12× warm TCP pipes · 0-RTT Open · 1-RTT Ground-TLS · Linux BBR · zlib(6)
-  Payload Delivered: 535 KB uncompressed (~118 KB on satellite wire via $0.03/h EU VM)
 ```
 
----
+## Problem
 
-## Why Inflight Wi-Fi Feels Worse Than Its Speed Cap
+Non-Starlink inflight Wi-Fi usually breaks on three things unrelated to raw bandwidth:
 
-Even when you pay for inflight Wi-Fi on a non-Starlink aircraft, three bottlenecks ruin it before bandwidth even matters:
+1. **Onboard `:443` middleboxes and DNS interception.** Cabin gateways intercept `:53` DNS and run a transparent `:443` split-TCP proxy (PEP) whose state table drops connections under load (`Connection reset by peer` / TLS timeouts on `github.com`, `api.github.com`, package registries). Non-443 TCP ports pass through untouched.
+2. **Handshake round-trips (`~620 ms` per GEO hop).** Every new origin normally pays multiple satellite round-trips (DNS + TCP + TLS) before transferring payload bytes.
+3. **Cubic congestion collapse.** Cabin Wi-Fi packet loss causes standard TCP to halve `cwnd` repeatedly, leaving most of your per-seat token-bucket cap unused.
 
-1. **3–4 trips to space before byte 1 (`~2.0–2.6s` wasted per host):** A geostationary satellite sits at `35,786 km` (`~600–680 ms` round-trip). Every new domain normally pays multiple satellite round-trips for DNS + TCP + TLS handshakes.
-2. **Overloaded onboard Port-443 proxy & hijacked DNS:** Most airlines run an onboard transparent proxy (`:443` Split-TCP PEP + spoofed `:53` DNS) whose connection table constantly overflows—causing `Connection reset by peer` and `10–50s` freezes on `github.com`, `api.github.com`, package registries, and dev tools.
-3. **Packet-loss TCP collapse:** Standard TCP mistakes random cabin Wi-Fi retries for congestion and slashes your download window, dropping a `4.5 Mbps` seat allowance down to `0.8–1.5 Mbps`.
-
----
-
-## How `satmux` Works
+## How it works
 
 ```text
-BEFORE (Direct Cabin Wi-Fi):
-  Laptop ──▶ [Hijacked DNS + Broken Plane :443 Proxy] ══(3–4× 36,000 km GEO hops)══▶ TCP Resets / 12s loads
+Direct (:443):
+  laptop ──▶ cabin DNS + :443 PEP ══(3–4 GEO RTTs)══▶ ground ──▶ origin  (frequent TCP resets)
 
-AFTER (satmux):
-  Laptop ══(12× pre-opened TCP :8444 BBR + zlib pipes — bypasses :443 proxy)══▶ Ground Fiber VM ──(2 ms)──▶ Internet
+satmux (:8444):
+  laptop ══(12 persistent TCP :8444 BBR + zlib pipes)══▶ ground VM ──(2 ms)──▶ origin
 ```
 
-- **Bypasses `:443` middleboxes & DNS hijacking:** Holds **12 persistent, pre-warmed TCP connections** open on a non-443 port (`:8444`) to your ground VM.
-- **0-RTT Pipelined `SOCKS5` & `HTTP CONNECT` (`127.0.0.1:1080` / `:8080`):** Replies `OK` locally in `0.1 ms` and ships `FT_OPEN + TLS ClientHello` in the same satellite packet, saving a full satellite RTT on every browser & CLI connection while keeping end-to-end TLS intact.
-- **1-RTT Ground-TLS + `zlib` Accelerator (`127.0.0.1:8081`):** Sends an encrypted (`BLAKE2b-512` keystream + `HMAC-SHA256`) fetch frame over a warm pipe so your ground VM resolves DNS, TLS 1.3, and HTTP redirects in **~2–5 ms on fiber**, compresses plaintext HTML/JSON **70–80% with `zlib`**, and streams it down in **1 satellite RTT**.
-- **Fixes Coding Agents (`git` + `gh` CLI):** Go binaries like `gh` ignore macOS system proxies and fail with `Post "https://api.github.com/graphql": connection reset by peer`. `satmux` exposes a local `0600` Unix socket (`http_unix_socket`) that wraps `gh` traffic in verified end-to-end TLS on your laptop and tunnels it over the warm carrier pool—fixing already-running agents immediately.
-- **Linux BBR + `MSS 1280`:** Ground VM paces packets using Google's BBR congestion control instead of collapsing on cabin Wi-Fi jitter.
+- **Persistent non-443 carrier pool (`:8444`):** Keeps 12 pre-warmed TCP connections open to a Linux VM near the satellite ground station, bypassing the cabin `:443` proxy and onboard DNS. Streams are scheduled onto the carrier with the lowest recent byte load so idle browser keepalives do not cause head-of-line queueing.
+- **0-RTT stream open (`127.0.0.1:1080` SOCKS5 / `127.0.0.1:8080` HTTP CONNECT):** Returns `OK` locally in `<1 ms` and sends `FT_OPEN` + TLS `ClientHello` in the same TCP burst, saving one full satellite RTT while preserving end-to-end TLS from the laptop.
+- **1-RTT ground fetch (`127.0.0.1:8081`):** Sends an encrypted (`BLAKE2b-512` stream + `HMAC-SHA256`) request frame over a warm carrier. The ground VM performs DNS, verified TLS 1.3, and HTTP redirects on fiber (`~2–5 ms`) and compresses plaintext responses with `zlib` before crossing the satellite link.
+- **`git` and `gh` CLI routing:** Go binaries such as `gh` ignore macOS `scutil` proxies. `satmux` exposes a `0600` local Unix socket (`/tmp/satmux-gh-tls.sock`) wired to `gh`'s `http_unix_socket` that wraps requests in verified end-to-end TLS on the laptop and tunnels them over SOCKS5, fixing already-running coding agents without restarting them.
+- **BBR + `MSS 1280`:** Ground-to-cabin sockets enable `TCP_CONGESTION=bbr` and `TCP_MAXSEG=1280`.
 
----
+## Limits
 
-## What to Expect (Honest Physics)
+- **Latency floor (`~580–650 ms`):** Speed-of-light propagation to geostationary orbit (`35,786 km`) does not change; `satmux` removes extra round-trips, not the physical RTT of one hop.
+- **Per-seat shaper (`~4–5 Mbps` typical):** Cabin routers police total bandwidth per client lease. Compressible traffic (HTML, JSON, code, APIs) exceeds that rate in effective throughput via `zlib`; already-compressed binaries (`.mp4`, `.zip`) stay bounded by the seat cap (though BBR + parallel `satmux-get` keep throughput near the ceiling).
+- **Single paid session:** Uses your authenticated cabin Wi-Fi lease; it does not bypass captive portals.
 
-| What improves dramatically | What stays bounded by physics / airline router |
-| --- | --- |
-| **0 dropped connections** on GitHub, APIs, registries (`gh`, `git`, browsers) | **Latency floor (~580–650 ms):** Radio waves still travel `~143,000 km` to GEO orbit and back |
-| **2×–5× faster web, API, JSON, docs & code loads** (`-70%` handshake lag + `zlib` wire compression) | **Raw binary ceiling (~4–5 Mbps):** Already-compressed `.mp4`/`.zip` files still respect your single paid seat's cabin router cap |
-| **Steady max-cap downloads** (`~3.8–4.5 Mbps` via BBR + parallel `satmux-get` vs `1 Mbps` dips) | **Single legitimate subscription:** Accelerates *your* paid seat session; does not bypass airline billing |
+## Setup
 
----
+### 1. Ground VM
 
-## What You Need
+Rent a small Linux VM (`$0.01–$0.03/h`, Python 3.9+, open TCP port `8444`) close to where the satellite downlinks to fiber. Check `curl ipinfo.io` on raw cabin Wi-Fi first to see the egress country/ASN:
 
-1. **One cheap Linux VPS (`~$0.01–$0.03/h`)** with Python 3.9+ and an open TCP port (e.g., `8444`):
-   - **Where to pick the region:** Pick a datacenter near your airline's satellite ground gateway!
-     - **Middle East / European carriers (Emirates, Qatar, Lufthansa, BA, AF):** **EU** (`Hetzner Helsinki / Falkenstein`, `Frankfurt`, `Amsterdam` — Inmarsat GX / SITA Europe lands in NL/DE).
-     - **North American carriers:** `us-east` (Virginia/NY) or `us-west`.
-     - **Asian/Pacific carriers:** `Singapore` or `Tokyo`.
-2. **macOS or Linux laptop** with Python 3.9+.
+- **Emirates / Middle East & European flights (Inmarsat GX / SITA `AS206433`):** Amsterdam, Frankfurt, or Hetzner EU (downlink lands in the Netherlands).
+- **North America:** `us-east` or `us-west`.
+- **Asia-Pacific:** Singapore or Tokyo.
 
-*(Tip: Pause VPNs like Tailscale/WireGuard while inflight—aircraft firewalls drop UDP, and background UDP retry storms steal your cabin Wi-Fi airtime.)*
+Pause UDP VPNs (Tailscale/WireGuard) inflight—blocked UDP retry traffic competes for cabin airtime.
 
----
+### 2. Run
 
-## Quick Start (60 Seconds)
+With a coding agent:
 
-### Option A: Just ask your AI coding agent
-> *"Set up `https://github.com/Th0rgal/satmux` on a temporary EU Ubuntu VM (`:8444`), start the local 12-carrier client, enable `satmux-macos on`, and run `satmux-bench`."*
+> Spin up a temporary Ubuntu VM near my current satellite egress IP, start `https://github.com/Th0rgal/satmux` on port `8444`, connect the local 12-carrier client, enable `bin/satmux-macos on`, and run `bin/satmux-bench`.
 
-### Option B: Manual 3-step setup
+Or manually:
 
-**1. Generate a pre-shared key on your laptop:**
 ```bash
+# 1. Laptop: generate PSK
 git clone https://github.com/Th0rgal/satmux.git && cd satmux
 openssl rand -hex 32 > mux.psk && chmod 600 mux.psk
-```
 
-**2. Start the relay on your Linux VM (`<SERVER_IP>`):**
-```bash
+# 2. Ground VM: start server
 scp satmux.py mux.psk root@<SERVER_IP>:/root/
 ssh root@<SERVER_IP> 'nohup env SATMUX_PSK=$(cat /root/mux.psk) python3 /root/satmux.py server --port 8444 >/var/log/satmux.log 2>&1 &'
-```
 
-**3. Start the local client & toggle macOS routing on:**
-```bash
+# 3. Laptop: start client + enable macOS / git / gh routing
 SATMUX_PSK=$(cat mux.psk) python3 satmux.py client --host <SERVER_IP> --port 8444 --carriers 12 &
 ./bin/satmux-macos on <SERVER_IP>
 ```
 
-**4. Verify & benchmark:**
+Benchmark or run parallel range downloads:
+
 ```bash
 ./bin/satmux-bench
-# Parallel multi-carrier downloader for large releases/tarballs:
-./bin/satmux-get https://example.com/large-archive.tar.gz
+./bin/satmux-get https://example.com/archive.tar.gz
 ```
 
-**5. When you land (important!):**
+### 3. Teardown after landing
+
 ```bash
 ./bin/satmux-macos off
 ```
-This cleanly restores macOS Wi-Fi proxy settings, `git`, `gh`, and `launchd` back to normal ground defaults. Destroy your temporary cloud VM and you're done!
 
----
+Restores macOS Wi-Fi proxy settings, `~/.gitconfig`, `gh` `http_unix_socket`, and `launchctl` env vars, then destroy the temporary VM.
 
 ## License
 
