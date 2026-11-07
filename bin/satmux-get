@@ -1,0 +1,97 @@
+#!/usr/bin/env python3
+"""
+satmux-get: Parallel 1-RTT HTTP Range Accelerator over the 12-Carrier Emirates Inflight Relay.
+Uses the local 1-RTT Ground-TLS gateway (127.0.0.1:8081) so both the initial Range probe and
+all N=8..12 parallel byte-range chunks execute with 0 satellite TLS/DNS handshakes + zlib(6)!
+Usage:
+  satmux-get <url> [-o output_file] [-n 8]
+"""
+import argparse
+import concurrent.futures
+import os
+import subprocess
+import sys
+import time
+import urllib.parse
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Parallel 1-RTT range downloader via local Sat-Mux")
+    ap.add_argument("url")
+    ap.add_argument("-o", "--output", default="")
+    ap.add_argument("-n", "--streams", type=int, default=8)
+    ap.add_argument("--gate", default="http://127.0.0.1:8081")
+    args = ap.parse_args()
+
+    out = args.output or os.path.basename(urllib.parse.urlparse(args.url).path) or "download.bin"
+    gate_url = f"{args.gate.rstrip('/')}/{args.url}"
+
+    t0 = time.time()
+    r = subprocess.run(
+        ["curl", "-sS", "--noproxy", "*", "-D", "-", "-o", "/dev/null", "-H", "Range: bytes=0-0", "--max-time", "12", gate_url],
+        capture_output=True, text=True
+    )
+    total_len = None
+    accept_ranges = False
+    for line in r.stdout.splitlines():
+        ll = line.lower()
+        if ll.startswith("content-range:"):
+            slash = line.rfind("/")
+            if slash != -1:
+                try:
+                    total_len = int(line[slash + 1 :].strip())
+                    accept_ranges = True
+                except Exception:
+                    pass
+        elif ll.startswith("content-length:") and total_len is None:
+            try:
+                cl = int(line.split(":", 1)[1].strip())
+                if cl > 1:
+                    total_len = cl
+            except Exception:
+                pass
+        if ll.startswith("accept-ranges:") and "bytes" in ll:
+            accept_ranges = True
+
+    if not total_len or total_len < 131072 or not accept_ranges:
+        subprocess.run(["curl", "-sS", "--noproxy", "*", "-o", out, gate_url], check=True)
+        dt = time.time() - t0
+        sz = os.path.getsize(out)
+        print(f"Downloaded {sz/1024:.1f} KB in {dt:.2f}s ({sz*8/dt/1e6:.2f} Mbps) -> {out}")
+        return
+
+    n = min(args.streams, max(1, total_len // 65536))
+    chunk = (total_len + n - 1) // n
+    ranges = []
+    for i in range(n):
+        start = i * chunk
+        end = min(total_len - 1, (i + 1) * chunk - 1)
+        if start <= end:
+            ranges.append((i, start, end))
+
+    def fetch_part(spec):
+        idx, start, end = spec
+        part = f"{out}.part{idx}"
+        for _attempt in range(3):
+            rc = subprocess.run(
+                ["curl", "-sS", "--noproxy", "*", "-H", f"Range: bytes={start}-{end}", "--max-time", "45", "-o", part, gate_url]
+            )
+            if rc.returncode == 0 and os.path.exists(part) and os.path.getsize(part) == (end - start + 1):
+                return part
+        raise RuntimeError(f"Part {idx} ({start}-{end}) failed")
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(ranges)) as ex:
+        parts = list(ex.map(fetch_part, ranges))
+
+    with open(out, "wb") as fout:
+        for p in parts:
+            with open(p, "rb") as fin:
+                fout.write(fin.read())
+            os.remove(p)
+
+    dt = time.time() - t0
+    print(f"Downloaded {total_len/1048576:.2f} MB across {len(ranges)} warm 1-RTT carriers in {dt:.2f}s ({total_len*8/dt/1e6:.2f} Mbps) -> {out}")
+
+
+if __name__ == "__main__":
+    main()

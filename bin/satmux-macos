@@ -1,0 +1,89 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SVC="${SATMUX_WIFI_SERVICE:-Wi-Fi}"
+SOCKS_PORT="${SATMUX_SOCKS_PORT:-1080}"
+HTTP_PORT="${SATMUX_HTTP_PORT:-8080}"
+GH_SOCK="${SATMUX_GH_SOCK:-/tmp/satmux-gh-tls.sock}"
+STATE_FILE="${HOME}/.cache/satmux-server-ip"
+
+cmd="${1:-status}"
+server_ip="${2:-}"
+
+case "$cmd" in
+  on)
+    if [ -n "$server_ip" ]; then
+      mkdir -p "$(dirname "$STATE_FILE")"
+      printf '%s\n' "$server_ip" > "$STATE_FILE"
+    elif [ -f "$STATE_FILE" ]; then
+      server_ip="$(cat "$STATE_FILE")"
+    fi
+
+    bypass=(127.0.0.1 localhost "*.local" 169.254/16 172.19.248.0/23 10.0.0.0/8)
+    if [ -n "$server_ip" ]; then
+      bypass+=("$server_ip")
+    fi
+    bypass_csv="$(IFS=,; echo "${bypass[*]}")"
+
+    # 1. macOS system proxy (Safari, Brave, Chrome, Arc, native URLSession apps)
+    networksetup -setproxybypassdomains "$SVC" "${bypass[@]}"
+    networksetup -setsocksfirewallproxy "$SVC" 127.0.0.1 "$SOCKS_PORT"
+    networksetup -setsocksfirewallproxystate "$SVC" on
+    networksetup -setwebproxy "$SVC" 127.0.0.1 "$HTTP_PORT"
+    networksetup -setwebproxystate "$SVC" on
+    networksetup -setsecurewebproxy "$SVC" 127.0.0.1 "$HTTP_PORT"
+    networksetup -setsecurewebproxystate "$SVC" on
+
+    # 2. Git HTTPS proxy in ~/.gitconfig (works even if ~/.config/git/config is read-only)
+    git config --file "$HOME/.gitconfig" http.proxy "socks5h://127.0.0.1:${SOCKS_PORT}"
+
+    # 3. GitHub CLI (`gh`) local verified-TLS Unix socket bridge (fixes Go `gh` ignoring scutil)
+    if command -v gh >/dev/null 2>&1; then
+      gh config set http_unix_socket "$GH_SOCK" 2>/dev/null || true
+    fi
+
+    # 4. launchd user environment for newly spawned GUI/CLI processes
+    launchctl setenv HTTPS_PROXY "http://127.0.0.1:${HTTP_PORT}" || true
+    launchctl setenv HTTP_PROXY "http://127.0.0.1:${HTTP_PORT}" || true
+    launchctl setenv ALL_PROXY "socks5h://127.0.0.1:${SOCKS_PORT}" || true
+    launchctl setenv NO_PROXY "$bypass_csv" || true
+
+    echo "satmux ENABLED on $SVC -> SOCKS5 127.0.0.1:${SOCKS_PORT} | HTTP/HTTPS 127.0.0.1:${HTTP_PORT} | gh ${GH_SOCK}"
+    ;;
+  off)
+    networksetup -setsocksfirewallproxystate "$SVC" off
+    networksetup -setwebproxystate "$SVC" off
+    networksetup -setsecurewebproxystate "$SVC" off
+    networksetup -setproxybypassdomains "$SVC" "*.local" "169.254/16"
+
+    if [ -f "$HOME/.gitconfig" ]; then
+      git config --file "$HOME/.gitconfig" --unset-all http.proxy 2>/dev/null || true
+      if [ ! -s "$HOME/.gitconfig" ] || ! grep -q '[^[:space:]]' "$HOME/.gitconfig"; then
+        rm -f "$HOME/.gitconfig"
+      fi
+    fi
+
+    if command -v gh >/dev/null 2>&1; then
+      gh config set http_unix_socket "" 2>/dev/null || true
+    fi
+
+    launchctl unsetenv HTTPS_PROXY HTTP_PROXY ALL_PROXY NO_PROXY 2>/dev/null || true
+    echo "satmux DISABLED on $SVC (normal ground routing restored)"
+    ;;
+  status)
+    echo "=== macOS SOCKS5 ($SVC) ==="
+    networksetup -getsocksfirewallproxy "$SVC"
+    echo "=== macOS HTTPS ($SVC) ==="
+    networksetup -getsecurewebproxy "$SVC"
+    echo "=== git http.proxy ==="
+    git config --get http.proxy || echo "(unset)"
+    if command -v gh >/dev/null 2>&1; then
+      echo "=== gh http_unix_socket ==="
+      gh config get http_unix_socket || echo "(unset)"
+    fi
+    ;;
+  *)
+    echo "Usage: $0 {on [SERVER_IP]|off|status}" >&2
+    exit 1
+    ;;
+esac
