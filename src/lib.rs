@@ -37,7 +37,7 @@ use std::{
 use tokio::{
     io::{self, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     net::{
-        TcpListener, TcpStream,
+        TcpListener, TcpSocket, TcpStream,
         tcp::{OwnedReadHalf, OwnedWriteHalf},
     },
     sync::{Mutex, mpsc},
@@ -71,7 +71,7 @@ impl ServerConfig {
     }
 }
 
-/// Local proxy settings. All TCP proxies bind to loopback.
+/// Local proxy settings. TCP proxies bind to loopback by default.
 #[derive(Clone)]
 pub struct ClientConfig {
     /// Ground relay address or hostname.
@@ -82,6 +82,8 @@ pub struct ClientConfig {
     pub psk: Vec<u8>,
     /// Number of persistent carrier connections; must be greater than zero.
     pub carriers: usize,
+    /// Host interface for the local TCP proxies. Defaults to loopback.
+    pub listen_host: String,
     /// Local SOCKS5 listening port.
     pub socks_port: u16,
     /// Local HTTP proxy listening port.
@@ -102,6 +104,7 @@ impl ClientConfig {
             port,
             psk,
             carriers: 12,
+            listen_host: "127.0.0.1".into(),
             socks_port: 1080,
             http_port: 8080,
             fast_port: 8081,
@@ -428,7 +431,7 @@ async fn server_stream(
                 .try_into()?,
         );
         let mut socket =
-            time::timeout(Duration::from_secs(8), TcpStream::connect((host, port))).await??;
+            time::timeout(Duration::from_secs(8), connect_tuned(host, port, 1400)).await??;
         tune_socket(&socket, 1400);
         let (mut rd, mut wr) = socket.split();
         let mut down = vec![0u8; MAX_CHUNK];
@@ -619,8 +622,11 @@ async fn maintain_carrier(state: Arc<ClientState>, idx: usize) {
     let mut backoff = 1.0;
     loop {
         let attempt = async {
-            let mut stream =
-                time::timeout(Duration::from_secs(12), TcpStream::connect(state.server)).await??;
+            let mut stream = time::timeout(
+                Duration::from_secs(12),
+                connect_tuned_addr(state.server, 1280),
+            )
+            .await??;
             tune_socket(&stream, 1280);
             let mut nonce = [0u8; 32];
             time::timeout(Duration::from_secs(10), stream.read_exact(&mut nonce)).await??;
@@ -1017,6 +1023,7 @@ pub async fn run_client(config: ClientConfig) -> Result<()> {
         port,
         psk,
         carriers,
+        listen_host,
         socks_port,
         http_port,
         fast_port,
@@ -1032,9 +1039,9 @@ pub async fn run_client(config: ClientConfig) -> Result<()> {
         .await?
         .next()
         .context("server DNS lookup returned no addresses")?;
-    let socks = TcpListener::bind(("127.0.0.1", socks_port)).await?;
-    let http = TcpListener::bind(("127.0.0.1", http_port)).await?;
-    let fast = TcpListener::bind(("127.0.0.1", fast_port)).await?;
+    let socks = TcpListener::bind((listen_host.as_str(), socks_port)).await?;
+    let http = TcpListener::bind((listen_host.as_str(), http_port)).await?;
+    let fast = TcpListener::bind((listen_host.as_str(), fast_port)).await?;
     let connector = tls_connector()?;
     let gh_listener = if let Some(path) = gh_socket.as_deref() {
         if Path::new(path).exists() {
@@ -1085,7 +1092,7 @@ pub async fn run_client(config: ClientConfig) -> Result<()> {
         }
     });
     println!(
-        "[mux-v3-client] Ready! SOCKS5=127.0.0.1:{socks_port} | HTTP=127.0.0.1:{http_port} | 1-RTT-Gate=127.0.0.1:{fast_port} | {carriers} warm carriers"
+        "[mux-v3-client] Ready! SOCKS5={listen_host}:{socks_port} | HTTP={listen_host}:{http_port} | 1-RTT-Gate={listen_host}:{fast_port} | {carriers} warm carriers"
     );
     loop {
         tokio::select! {
@@ -1139,30 +1146,92 @@ fn tune_socket(stream: &TcpStream, mss: u32) {
     #[cfg(target_os = "linux")]
     {
         use std::os::fd::AsRawFd;
-        let fd = stream.as_raw_fd();
-        unsafe {
-            let _ = libc_setsockopt(fd, 6, 10, &mss);
-            let bbr = b"bbr\0";
-            let _ = libc_setsockopt_bytes(fd, 6, 13, bbr);
-        }
+        tune_socket_fd(stream.as_raw_fd(), mss);
     }
 }
 
-#[cfg(target_os = "linux")]
-unsafe fn libc_setsockopt(fd: i32, level: i32, name: i32, value: &u32) -> i32 {
-    unsafe { libc::setsockopt(fd, level, name, (value as *const u32).cast(), 4) }
+async fn connect_tuned(host: &str, port: u16, mss: u32) -> Result<TcpStream> {
+    let addresses = tokio::net::lookup_host((host, port))
+        .await?
+        .collect::<Vec<_>>();
+    if addresses.is_empty() {
+        bail!("target DNS lookup returned no addresses");
+    }
+    let mut last_error = None;
+    for address in addresses {
+        match connect_tuned_addr(address, mss).await {
+            Ok(stream) => return Ok(stream),
+            Err(error) => last_error = Some(error),
+        }
+    }
+    Err(last_error.context("unable to connect to any target address")?)
+}
+
+async fn connect_tuned_addr(address: SocketAddr, mss: u32) -> Result<TcpStream> {
+    let socket = if address.is_ipv4() {
+        TcpSocket::new_v4()?
+    } else {
+        TcpSocket::new_v6()?
+    };
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::AsRawFd;
+        tune_socket_fd(socket.as_raw_fd(), mss);
+    }
+    let stream = socket.connect(address).await?;
+    tune_socket(&stream, mss);
+    Ok(stream)
 }
 
 #[cfg(target_os = "linux")]
-unsafe fn libc_setsockopt_bytes(fd: i32, level: i32, name: i32, value: &[u8]) -> i32 {
+fn tune_socket_fd(fd: std::os::fd::RawFd, mss: u32) {
     unsafe {
+        let enabled: libc::c_int = 1;
+        let buffer_size: libc::c_int = 2 * 1024 * 1024;
+        let mss = mss as libc::c_int;
+        let _ = libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_KEEPALIVE,
+            (&enabled as *const libc::c_int).cast(),
+            std::mem::size_of_val(&enabled) as libc::socklen_t,
+        );
+        let _ = libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_RCVBUF,
+            (&buffer_size as *const libc::c_int).cast(),
+            std::mem::size_of_val(&buffer_size) as libc::socklen_t,
+        );
+        let _ = libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_SNDBUF,
+            (&buffer_size as *const libc::c_int).cast(),
+            std::mem::size_of_val(&buffer_size) as libc::socklen_t,
+        );
         libc::setsockopt(
             fd,
-            level,
-            name,
-            value.as_ptr().cast(),
-            value.len() as libc::socklen_t,
-        )
+            libc::IPPROTO_TCP,
+            libc::TCP_NODELAY,
+            (&enabled as *const libc::c_int).cast(),
+            std::mem::size_of_val(&enabled) as libc::socklen_t,
+        );
+        let _ = libc::setsockopt(
+            fd,
+            libc::IPPROTO_TCP,
+            libc::TCP_MAXSEG,
+            (&mss as *const libc::c_int).cast(),
+            std::mem::size_of_val(&mss) as libc::socklen_t,
+        );
+        let congestion = b"bbr\0";
+        let _ = libc::setsockopt(
+            fd,
+            libc::IPPROTO_TCP,
+            libc::TCP_CONGESTION,
+            congestion.as_ptr().cast(),
+            congestion.len() as libc::socklen_t,
+        );
     }
 }
 
@@ -1234,6 +1303,33 @@ mod tests {
         assert_eq!(frame.kind, FT_OPEN);
         assert_eq!(frame.sid, 0x0102_0304);
         assert_eq!(frame.payload, [0xaa, 0xbb]);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn linux_outbound_socket_applies_mss_before_connect() {
+        use std::{mem::size_of, os::fd::AsRawFd};
+
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let connect = connect_tuned_addr(address, 1200);
+        let (client, accepted) = tokio::join!(connect, listener.accept());
+        let client = client.unwrap();
+        let _accepted = accepted.unwrap().0;
+
+        let mut mss: libc::c_int = 0;
+        let mut mss_len = size_of::<libc::c_int>() as libc::socklen_t;
+        let result = unsafe {
+            libc::getsockopt(
+                client.as_raw_fd(),
+                libc::IPPROTO_TCP,
+                libc::TCP_MAXSEG,
+                (&mut mss as *mut libc::c_int).cast(),
+                &mut mss_len,
+            )
+        };
+        assert_eq!(result, 0);
+        assert!(mss > 0 && mss <= 1200, "configured MSS was {mss}");
     }
 
     #[tokio::test]

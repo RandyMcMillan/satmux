@@ -4,6 +4,7 @@ fn satmux() -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_satmux"));
     command
         .env_remove("SATMUX_PSK")
+        .env_remove("SATMUX_PSK_FILE")
         .env_remove("ORB_MUX_PSK")
         .env_remove("SATMUX_GH_SOCK");
     command
@@ -20,7 +21,9 @@ fn help_is_available_without_a_key() {
             "--host",
             "--port",
             "--psk-hex",
+            "--psk-file",
             "--carriers",
+            "--proxy-host",
             "--socks-port",
             "--http-port",
             "--fast-port",
@@ -35,7 +38,10 @@ fn help_is_available_without_a_key() {
 fn missing_key_still_exits_with_an_explicit_error() {
     let output = satmux().arg("server").output().unwrap();
     assert_eq!(output.status.code(), Some(2));
-    assert!(String::from_utf8_lossy(&output.stderr).contains("Missing --psk-hex or SATMUX_PSK"));
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("Missing --psk-hex, SATMUX_PSK, or SATMUX_PSK_FILE")
+    );
 }
 
 #[test]
@@ -61,4 +67,31 @@ fn explicit_key_overrides_the_environment() {
         .unwrap();
     assert_eq!(output.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&output.stderr).contains("at least one carrier"));
+}
+
+#[test]
+fn psk_file_is_supported_and_explicit_hex_takes_precedence() {
+    let path = std::env::temp_dir().join(format!(
+        "satmux-psk-{}-{}",
+        std::process::id(),
+        std::thread::current().name().unwrap_or("test")
+    ));
+    std::fs::write(&path, "42\n").unwrap();
+    let path = path.to_string_lossy().into_owned();
+    let output = satmux()
+        .env("SATMUX_PSK_FILE", &path)
+        .args(["client", "--psk-file", &path, "--carriers", "0"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("at least one carrier"));
+
+    let output = satmux()
+        .env("SATMUX_PSK_FILE", "/no/such/secret")
+        .args(["client", "--psk-hex", "42", "--carriers", "0"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("at least one carrier"));
+    std::fs::remove_file(path).unwrap();
 }

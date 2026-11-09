@@ -21,6 +21,7 @@ fn configuration_is_explicit_and_client_defaults_match_proxy_ports() {
     assert_eq!(client.port, 8444);
     assert_eq!(client.psk, psk);
     assert_eq!(client.carriers, 12);
+    assert_eq!(client.listen_host, "127.0.0.1");
     assert_eq!(client.socks_port, 1080);
     assert_eq!(client.http_port, 8080);
     assert_eq!(client.fast_port, 8081);
