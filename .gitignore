@@ -1,3 +1,4 @@
+/target/
 *.psk
 mux.psk
 __pycache__/
