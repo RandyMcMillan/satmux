@@ -34,6 +34,45 @@ or use `--psk-hex`.
 The original helper scripts remain available as `py/bin/satmux-bench`,
 `py/bin/satmux-get`, and `py/bin/satmux-macos`.
 
+## Use as a library
+
+The package provides both the `satmux` library and the `satmux` binary. Add it
+to another crate using a local path (adjust the path to this checkout):
+
+```toml
+[dependencies]
+anyhow = "1"
+satmux = { path = "../satmux" }
+tokio = { version = "1", features = ["full"] }
+```
+
+Call the async entry points from your application's Tokio runtime:
+
+```rust,no_run
+use satmux::{ClientConfig, ServerConfig, run_client, run_server};
+
+async fn relay(psk: Vec<u8>) -> anyhow::Result<()> {
+    let server = ServerConfig::new("0.0.0.0", 8444, psk.clone());
+    let mut client = ClientConfig::new("127.0.0.1", 8444, psk);
+    client.carriers = 4;
+    client.socks_port = 1081;
+
+    tokio::try_join!(run_server(server), run_client(client))?;
+    Ok(())
+}
+```
+
+Keys are raw bytes, not hex strings. Library calls do not read environment
+variables, create a runtime, or exit the process; errors are returned to the
+caller. `ClientConfig::new` uses 12 carriers and the usual TCP proxy ports, but
+disables the Unix socket bridge unless `gh_socket` is explicitly set. The CLI
+retains its existing defaults, environment variables, and flags.
+
+Both entry points run until an error or cancellation. Drop their futures (or
+abort their Tokio tasks) to close TCP listeners and abort their background
+connections. An enabled Unix socket may leave its socket file behind after
+cancellation; a subsequent client start removes it.
+
 ## Functional parity checks
 
 Run the Rust unit tests with:
@@ -42,9 +81,10 @@ Run the Rust unit tests with:
 cargo test
 ```
 
-The tests cover protocol key derivation, encrypted/compressed framing, and
-HTTP proxy target parsing. The wire protocol remains compatible with the
-Python implementation in `py/satmux.py`.
+The tests cover protocol key derivation, encrypted/compressed framing, a live
+TCP tunnel, public library configuration and cancellation, and CLI compatibility.
+The library example is also compiled as a doctest. The wire protocol remains
+compatible with the Python implementation in `py/satmux.py`.
 
 ## License
 
